@@ -21,6 +21,16 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 class V2NoxVpnService : VpnService() {
+    inner class LocalBinder : android.os.Binder() { val service: V2NoxVpnService get() = this@V2NoxVpnService }
+    private val localBinder = LocalBinder()
+
+    override fun onBind(intent: Intent): android.os.IBinder = localBinder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) stopVpn()
+        return START_NOT_STICKY
+    }
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val operationMutex = Mutex()
     private val mutableState = MutableStateFlow(VpnState.DISCONNECTED)
@@ -140,6 +150,7 @@ class V2NoxVpnService : VpnService() {
 
     companion object {
         const val CHANNEL_ID = "v2nox_vpn"
+        const val ACTION_STOP = "com.v2nox.app.action.STOP_VPN"
         private const val NOTIFICATION_ID = 2101
     }
 }
