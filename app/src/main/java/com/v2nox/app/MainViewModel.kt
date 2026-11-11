@@ -6,7 +6,8 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.net.VpnService
 import android.os.IBinder
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,6 +16,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.net.URI
 import java.util.UUID
@@ -26,9 +29,10 @@ data class MainUiState(
     val errorMessage: String? = null,
 )
 
-class MainViewModel : ViewModel() {
+class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val mutableUiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = mutableUiState.asStateFlow()
+    private val serverRepository = ServerRepository(application)
 
     private val mutablePermissionRequests = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
     val permissionRequests: SharedFlow<Intent> = mutablePermissionRequests.asSharedFlow()
@@ -36,6 +40,20 @@ class MainViewModel : ViewModel() {
     private var service: V2NoxVpnService? = null
     private var boundContext: Context? = null
     private var pendingConfig: ServerConfig? = null
+
+    init {
+        viewModelScope.launch {
+            combine(serverRepository.servers, serverRepository.activeServerId) { configs, activeId ->
+                configs to activeId
+            }.collect { (configs, activeId) ->
+                mutableUiState.value = mutableUiState.value.copy(
+                    savedConfigs = configs,
+                    activeConfig = configs.firstOrNull { it.id == activeId },
+                )
+            }
+        }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val instance = (binder as? V2NoxVpnService.LocalBinder)?.service ?: return
@@ -52,23 +70,39 @@ class MainViewModel : ViewModel() {
         runCatching { VlessParser.parse(text) }
             .onSuccess { parsed ->
                 val existing = mutableUiState.value.savedConfigs
-                if (existing.none { it.rawUrl == parsed.rawUrl }) mutableUiState.value = mutableUiState.value.copy(
-                    savedConfigs = existing + parsed,
-                    activeConfig = mutableUiState.value.activeConfig ?: parsed,
-                    errorMessage = null,
-                )
+                if (existing.none { it.rawUrl == parsed.rawUrl }) {
+                    val shouldActivate = mutableUiState.value.activeConfig == null
+                    mutableUiState.value = mutableUiState.value.copy(
+                        savedConfigs = existing + parsed,
+                        activeConfig = mutableUiState.value.activeConfig ?: parsed,
+                        errorMessage = null,
+                    )
+                    viewModelScope.launch {
+                        serverRepository.saveServer(parsed)
+                        if (shouldActivate && serverRepository.activeServerId.first() == null) {
+                            serverRepository.setActiveServerId(parsed.id)
+                        }
+                    }
+                }
             }
             .onFailure { mutableUiState.value = mutableUiState.value.copy(errorMessage = it.message ?: "Не удалось прочитать конфигурацию") }
     }
 
     fun selectConfig(config: ServerConfig) {
         mutableUiState.value = mutableUiState.value.copy(activeConfig = config, errorMessage = null)
+        viewModelScope.launch { serverRepository.setActiveServerId(config.id) }
     }
 
     fun deleteConfig(config: ServerConfig) {
         val current = mutableUiState.value
         val updated = current.savedConfigs.filterNot { it.id == config.id }
         mutableUiState.value = current.copy(savedConfigs = updated, activeConfig = if (current.activeConfig?.id == config.id) updated.firstOrNull() else current.activeConfig)
+        viewModelScope.launch {
+            serverRepository.removeServer(config.id)
+            if (current.activeConfig?.id == config.id) {
+                serverRepository.setActiveServerId(updated.firstOrNull()?.id)
+            }
+        }
     }
 
     fun toggleVpn(context: Context) {
