@@ -19,6 +19,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import libv2ray.CoreController
+import libv2ray.Libv2ray
+import org.json.JSONArray
+import org.json.JSONObject
 
 class V2NoxVpnService : VpnService() {
     inner class LocalBinder : android.os.Binder() { val service: V2NoxVpnService get() = this@V2NoxVpnService }
@@ -38,6 +42,8 @@ class V2NoxVpnService : VpnService() {
 
     @Volatile
     private var tunInterface: ParcelFileDescriptor? = null
+    @Volatile
+    private var coreController: CoreController? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -53,6 +59,7 @@ class V2NoxVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
 
                 try {
+                    Libv2ray.initCoreEnv(filesDir.absolutePath, cacheDir.absolutePath)
                     val established = Builder()
                         .setSession(config.name)
                         .setMtu(1500)
@@ -61,13 +68,15 @@ class V2NoxVpnService : VpnService() {
                         .establish() ?: error("Не удалось создать VPN-интерфейс")
 
                     tunInterface = established
-
-                    // TODO(libv2ray.aar): передать established.fileDescriptor и config
-                    // в API ядра, запустить туннель и обработать его завершение/ошибку.
+                    val controller = Libv2ray.newCoreController(null)
+                    controller.startLoop(buildXrayConfig(config), established.fd)
+                    coreController = controller
 
                     mutableState.value = VpnState.CONNECTED
                     updateNotification("Подключено: ${config.name}")
                 } catch (exception: Exception) {
+                    runCatching { coreController?.stopLoop() }
+                    coreController = null
                     tunInterface?.close()
                     tunInterface = null
                     mutableState.value = VpnState.DISCONNECTED
@@ -92,12 +101,38 @@ class V2NoxVpnService : VpnService() {
         }
         mutableState.value = VpnState.STOPPING
 
-        // TODO(libv2ray.aar): остановить ядро до закрытия принадлежащего ему TUN-дескриптора.
+        runCatching { coreController?.stopLoop() }
+        coreController = null
         runCatching { tunInterface?.close() }
         tunInterface = null
         mutableState.value = VpnState.DISCONNECTED
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun buildXrayConfig(config: ServerConfig): String {
+        val uuid = runCatching { java.net.URI(config.rawUrl).userInfo }.getOrNull()
+            ?.substringBefore(':')
+            ?.takeIf(String::isNotBlank)
+            ?: error("В VLESS-конфигурации отсутствует UUID")
+        return JSONObject().apply {
+            put("log", JSONObject().put("loglevel", "warning"))
+            put("inbounds", JSONArray().put(JSONObject()
+                .put("tag", "tun-in")
+                .put("port", 0)
+                .put("protocol", "dokodemo-door")
+                .put("settings", JSONObject().put("network", "tcp,udp").put("followRedirect", true))))
+            put("outbounds", JSONArray().put(JSONObject()
+                .put("tag", "proxy")
+                .put("protocol", "vless")
+                .put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
+                    .put("address", config.address)
+                    .put("port", config.port)
+                    .put("users", JSONArray().put(JSONObject().put("id", uuid).put("encryption", "none")))))))
+                .put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
+            put("routing", JSONObject().put("rules", JSONArray().put(JSONObject()
+                .put("type", "field").put("inboundTag", JSONArray().put("tun-in")).put("outboundTag", "proxy"))))
+        }.toString()
     }
 
     override fun onRevoke() {
@@ -106,6 +141,8 @@ class V2NoxVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        runCatching { coreController?.stopLoop() }
+        coreController = null
         runCatching { tunInterface?.close() }
         tunInterface = null
         serviceScope.cancel()
